@@ -1,0 +1,345 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+//////////////////////////////
+// ENUMS
+//////////////////////////////
+
+enum Role {
+  OWNER
+  ADMIN
+  STAFF
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELED
+  PAST_DUE
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELED
+  COMPLETED
+  NO_SHOW
+}
+
+enum AppointmentSource {
+  WHATSAPP
+  DASHBOARD
+}
+
+enum ScheduleExceptionType {
+  BLOCKED
+  SPECIAL
+}
+
+//////////////////////////////
+// PLAN & BILLING
+//////////////////////////////
+
+model Plan {
+  id                      String @id @default(uuid())
+  name                    String
+  priceMonthly            Float
+  maxStaff                Int
+  maxBranches             Int
+  maxAppointmentsPerMonth Int
+  maxServices             Int
+
+  subscriptions Subscription[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Subscription {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String       @unique
+
+  plan   Plan   @relation(fields: [planId], references: [id])
+  planId String
+
+  status           SubscriptionStatus
+  currentPeriodEnd DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+//////////////////////////////
+// CORE TENANT
+//////////////////////////////
+
+model Organization {
+  id       String @id @default(uuid())
+  name     String
+  email    String
+  phone    String
+  settings Json?
+
+  subscription     Subscription?
+  branches         Branch[]
+  members          OrganizationMember[]
+  services         Service[]
+  staffProfiles    StaffProfile[]
+  appointments     Appointment[]
+  whatsappSessions WhatsAppSession[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([email])
+}
+
+model Branch {
+  id       String  @id @default(uuid())
+  name     String
+  address  String
+  timezone String
+  phone    String?
+  active   Boolean @default(true)
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+
+  staffBranches      StaffBranch[]
+  serviceBranches    ServiceBranch[]
+  schedules          Schedule[]
+  scheduleExceptions ScheduleException[]
+  appointments       Appointment[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([organizationId])
+}
+
+//////////////////////////////
+// USERS & STAFF
+//////////////////////////////
+
+model User {
+  id       String  @id @default(uuid())
+  email    String  @unique
+  password String
+  name     String
+  phone    String? // Agregado para futura integración WhatsApp
+  active   Boolean @default(true)
+
+  memberships   OrganizationMember[]
+  staffProfiles StaffProfile[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model OrganizationMember {
+  id String @id @default(uuid())
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  role Role
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, userId])
+}
+
+model StaffProfile {
+  id                        String  @id @default(uuid())
+  bio                       String?
+  maxConcurrentAppointments Int     @default(1)
+  active                    Boolean @default(true)
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  staffBranches      StaffBranch[]
+  staffServices      StaffService[]
+  schedules          Schedule[]
+  scheduleExceptions ScheduleException[]
+  appointments       Appointment[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([organizationId, userId])
+  @@index([organizationId])
+}
+
+model StaffBranch {
+  id String @id @default(uuid())
+
+  staffProfile   StaffProfile @relation(fields: [staffProfileId], references: [id])
+  staffProfileId String
+
+  branch   Branch @relation(fields: [branchId], references: [id])
+  branchId String
+
+  @@unique([staffProfileId, branchId])
+}
+
+//////////////////////////////
+// SERVICES
+//////////////////////////////
+
+model Service {
+  id              String  @id @default(uuid())
+  name            String
+  durationMinutes Int
+  description     String?
+  active          Boolean @default(true)
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+
+  serviceBranches ServiceBranch[]
+  staffServices   StaffService[]
+  appointments    Appointment[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([organizationId])
+}
+
+model ServiceBranch {
+  id     String  @id @default(uuid())
+  price  Float
+  active Boolean @default(true)
+
+  service   Service @relation(fields: [serviceId], references: [id])
+  serviceId String
+
+  branch   Branch @relation(fields: [branchId], references: [id])
+  branchId String
+
+  @@unique([serviceId, branchId])
+}
+
+model StaffService {
+  id String @id @default(uuid())
+
+  staffProfile   StaffProfile @relation(fields: [staffProfileId], references: [id])
+  staffProfileId String
+
+  service   Service @relation(fields: [serviceId], references: [id])
+  serviceId String
+
+  @@unique([staffProfileId, serviceId])
+}
+
+//////////////////////////////
+// SCHEDULING
+//////////////////////////////
+
+model Schedule {
+  id        String   @id @default(uuid())
+  dayOfWeek Int
+  startTime DateTime
+  endTime   DateTime
+
+  staffProfile   StaffProfile @relation(fields: [staffProfileId], references: [id])
+  staffProfileId String
+
+  branch   Branch @relation(fields: [branchId], references: [id])
+  branchId String
+
+  @@index([staffProfileId])
+}
+
+model ScheduleException {
+  id        String                @id @default(uuid())
+  date      DateTime
+  startTime DateTime?
+  endTime   DateTime?
+  type      ScheduleExceptionType
+
+  staffProfile   StaffProfile @relation(fields: [staffProfileId], references: [id])
+  staffProfileId String
+
+  branch   Branch @relation(fields: [branchId], references: [id])
+  branchId String
+}
+
+//////////////////////////////
+// APPOINTMENTS
+//////////////////////////////
+
+model Appointment {
+  id String @id @default(uuid())
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+
+  branch   Branch @relation(fields: [branchId], references: [id])
+  branchId String
+
+  service   Service @relation(fields: [serviceId], references: [id])
+  serviceId String
+
+  staffProfile   StaffProfile @relation(fields: [staffProfileId], references: [id])
+  staffProfileId String
+
+  customerName  String
+  customerPhone String
+
+  startAt DateTime
+  endAt   DateTime
+
+  status AppointmentStatus
+  source AppointmentSource @default(WHATSAPP)
+  notes  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([branchId, status]) // Optimiza el filtrado en el calendario de la sucursal
+  @@index([organizationId])
+  @@index([staffProfileId])
+  @@index([startAt])
+}
+
+//////////////////////////////
+// WHATSAPP SESSION
+//////////////////////////////
+
+model WhatsAppSession {
+  id                String   @id @default(uuid())
+  customerPhone     String
+  currentStep       String
+  metadata          Json?
+  lastInteractionAt DateTime
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, customerPhone])
+}
