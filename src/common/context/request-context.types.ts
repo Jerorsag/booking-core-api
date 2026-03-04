@@ -6,6 +6,9 @@ export interface RequestUser {
   id?: string;
   userId?: string;
   organizationId?: string;
+  role?: string;
+  systemRole?: string;
+  roles?: string[];
 }
 
 export interface RequestWithContext extends Request {
