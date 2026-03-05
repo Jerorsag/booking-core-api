@@ -16,9 +16,13 @@ datasource db {
 // ENUMS
 //////////////////////////////
 
-enum Role {
+enum SystemRole {
+  USER
+  SUPER_ADMIN
+}
+
+enum OrganizationRole {
   OWNER
-  ADMIN
   STAFF
 }
 
@@ -44,6 +48,10 @@ enum AppointmentSource {
 enum ScheduleExceptionType {
   BLOCKED
   SPECIAL
+}
+
+enum OtpCodeType {
+  PASSWORD_RESET
 }
 
 //////////////////////////////
@@ -135,18 +143,22 @@ model Branch {
 //////////////////////////////
 
 model User {
-  id       String  @id @default(uuid())
-  email    String  @unique
-  password String
-  name     String
-  phone    String? // Agregado para futura integración WhatsApp
-  active   Boolean @default(true)
+  id                  String     @id @default(uuid())
+  phone               String?    @unique
+  email               String?    @unique
+  passwordHash        String?
+  systemRole          SystemRole @default(USER)
+  isPhoneVerified     Boolean    @default(false)
+  isEmailVerified     Boolean    @default(false)
+  failedLoginAttempts Int        @default(0)
+  lockUntil           DateTime?
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
 
   memberships   OrganizationMember[]
+  refreshTokens RefreshToken[]
+  otpCodes      OtpCode[]
   staffProfiles StaffProfile[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
 }
 
 model OrganizationMember {
@@ -158,11 +170,42 @@ model OrganizationMember {
   user   User   @relation(fields: [userId], references: [id])
   userId String
 
-  role Role
+  role OrganizationRole
 
   createdAt DateTime @default(now())
 
   @@unique([organizationId, userId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model OtpCode {
+  id        String   @id @default(uuid())
+  userId    String
+  type      OtpCodeType
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([userId, type, expiresAt])
+  @@index([expiresAt])
 }
 
 model StaffProfile {

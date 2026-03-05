@@ -1,17 +1,174 @@
 import {
+  BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { Prisma, Role } from '@prisma/client';
+import { randomUUID } from 'crypto';
+import {
+  OrganizationRole,
+  Prisma,
+  SystemRole,
+} from '@prisma/client';
+import { PasswordService } from '../auth/services/password.service';
+import { TokenService } from '../auth/services/token.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { CreateStaffDto } from './dto/create-staff.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { ListOrganizationsDto } from './dto/list-organizations.dto';
+import { RegisterOrganizationDto } from './dto/register-organization.dto';
 
 @Injectable()
 export class OrganizationsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly passwordService: PasswordService,
+    private readonly tokenService: TokenService,
+  ) {}
+
+  async registerOrganization(dto: RegisterOrganizationDto) {
+    const normalizedEmail = dto.ownerEmail.trim().toLowerCase();
+    await this.ensurePasswordStrong(dto.ownerPassword);
+    await this.ensureEmailIsUnique(normalizedEmail);
+    await this.ensureOrganizationNameIsUnique(dto.organizationName);
+
+    return this.prisma.$transaction(async (tx) => {
+      const ownerPasswordHash = await this.passwordService.hashPassword(
+        dto.ownerPassword,
+      );
+
+      const owner = await tx.user.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash: ownerPasswordHash,
+          systemRole: SystemRole.USER,
+          isEmailVerified: false,
+          isPhoneVerified: false,
+        },
+      });
+
+      const organization = await tx.organization.create({
+        data: {
+          name: dto.organizationName,
+          email: normalizedEmail,
+          // Se deja un valor temporal para no forzar captura de teléfono en esta fase.
+          phone: 'PENDING_PHONE',
+        },
+      });
+
+      await tx.organizationMember.create({
+        data: {
+          organizationId: organization.id,
+          userId: owner.id,
+          role: OrganizationRole.OWNER,
+        },
+      });
+
+      const refreshJti = randomUUID();
+      const accessToken = await this.tokenService.generateAccessToken({
+        sub: owner.id,
+        systemRole: owner.systemRole,
+        organizationId: organization.id,
+      });
+      const refreshToken = await this.tokenService.generateRefreshToken({
+        sub: owner.id,
+        systemRole: owner.systemRole,
+        organizationId: organization.id,
+        jti: refreshJti,
+      });
+      const refreshTokenHash = await this.tokenService.hashToken(refreshToken);
+
+      // Seguridad: se guarda únicamente el hash del refresh token para evitar filtración útil.
+      await tx.refreshToken.create({
+        data: {
+          id: refreshJti,
+          userId: owner.id,
+          tokenHash: refreshTokenHash,
+          expiresAt: this.tokenService.getRefreshTokenExpiryDate(),
+          revokedAt: null,
+        },
+      });
+
+      return {
+        organizationId: organization.id,
+        ownerUserId: owner.id,
+        accessToken,
+        refreshToken,
+      };
+    });
+  }
+
+  async createStaff(
+    organizationId: string,
+    dto: CreateStaffDto,
+    actorId: string | null,
+  ) {
+    if (!actorId) {
+      throw new UnauthorizedException('No se pudo identificar el usuario actor.');
+    }
+
+    await this.ensurePasswordStrong(dto.password);
+    const normalizedEmail = dto.email.trim().toLowerCase();
+
+    const [organization, ownerMembership] = await Promise.all([
+      this.prisma.organization.findFirst({
+        where: { id: organizationId, deletedAt: null },
+        select: { id: true },
+      }),
+      this.prisma.organizationMember.findFirst({
+        where: {
+          organizationId,
+          userId: actorId,
+          role: OrganizationRole.OWNER,
+        },
+        select: { id: true },
+      }),
+    ]);
+
+    if (!organization) {
+      throw new NotFoundException('La organización solicitada no existe.');
+    }
+
+    if (!ownerMembership) {
+      throw new ForbiddenException(
+        'Acceso denegado: solo un OWNER puede crear usuarios STAFF.',
+      );
+    }
+
+    await this.ensureEmailIsUnique(normalizedEmail);
+
+    return this.prisma.$transaction(async (tx) => {
+      const passwordHash = await this.passwordService.hashPassword(dto.password);
+      const staffUser = await tx.user.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          systemRole: SystemRole.USER,
+          isEmailVerified: false,
+          isPhoneVerified: false,
+        },
+      });
+
+      const membership = await tx.organizationMember.create({
+        data: {
+          organizationId,
+          userId: staffUser.id,
+          role: OrganizationRole.STAFF,
+        },
+      });
+
+      // No emitimos tokens automáticamente para mantener alta por invitación/controlada.
+      return {
+        userId: staffUser.id,
+        email: staffUser.email,
+        organizationId,
+        membershipId: membership.id,
+        role: membership.role,
+      };
+    });
+  }
 
   async createOrganization(
     dto: CreateOrganizationDto,
@@ -53,7 +210,7 @@ export class OrganizationsService {
         data: {
           organizationId: createdOrganization.id,
           userId: actorId,
-          role: Role.OWNER,
+          role: OrganizationRole.OWNER,
         },
       });
 
@@ -146,5 +303,41 @@ export class OrganizationsService {
     throw new ConflictException(
       'Ya existe una organización activa con el mismo correo.',
     );
+  }
+
+  private async ensureOrganizationNameIsUnique(name: string): Promise<void> {
+    const existing = await this.prisma.organization.findFirst({
+      where: {
+        deletedAt: null,
+        name: { equals: name, mode: 'insensitive' },
+      },
+      select: { id: true },
+    });
+
+    if (existing) {
+      throw new ConflictException(
+        'Ya existe una organización activa con el mismo nombre.',
+      );
+    }
+  }
+
+  private async ensureEmailIsUnique(email: string): Promise<void> {
+    const existingUser = await this.prisma.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
+      select: { id: true },
+    });
+
+    if (existingUser) {
+      throw new ConflictException('Ya existe un usuario con ese correo.');
+    }
+  }
+
+  private async ensurePasswordStrong(password: string): Promise<void> {
+    const isStrong = /^(?=.*[A-Za-z])(?=.*\d).{8,}$/.test(password);
+    if (!isStrong) {
+      throw new BadRequestException(
+        'La contraseña debe tener mínimo 8 caracteres, una letra y un número.',
+      );
+    }
   }
 }
