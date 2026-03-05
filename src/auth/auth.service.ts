@@ -3,25 +3,38 @@ import {
   Injectable,
   UnauthorizedException,
   BadRequestException,
+  ForbiddenException,
+  NotFoundException,
 } from '@nestjs/common';
-import { OtpCodeType, Prisma } from '@prisma/client';
+import { OrganizationRole, OtpCodeType, Prisma, SystemRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { CompleteRegistrationDto } from './dto/complete-registration.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
+import { RequestOtpDto } from './dto/request-otp.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { SelectOrganizationDto } from './dto/select-organization.dto';
+import { VerifyOtpDto } from './dto/verify-otp.dto';
 import { PasswordService } from './services/password.service';
 import { TokenService } from './services/token.service';
 
 const INVALID_CREDENTIALS_MESSAGE = 'Credenciales inválidas';
 const INVALID_TOKEN_MESSAGE = 'Token inválido';
+const GENERIC_OTP_REQUEST_MESSAGE =
+  'Si el número existe, se ha enviado un código de verificación.';
 const GENERIC_RESET_REQUEST_MESSAGE =
   'Si el usuario existe, se ha enviado un código de recuperación.';
 const INVALID_OTP_MESSAGE = 'Código inválido';
+const INVALID_ORGANIZATION_MESSAGE = 'Organización inválida';
+const INVALID_REGISTRATION_MESSAGE = 'Datos de registro inválidos';
 const RESET_PASSWORD_SUCCESS_MESSAGE = 'Contraseña actualizada correctamente';
 const MAX_FAILED_ATTEMPTS = 5;
 const ACCOUNT_LOCK_MINUTES = 15;
+const LOGIN_OTP_TTL_MINUTES = 5;
 const PASSWORD_RESET_OTP_TTL_MINUTES = 10;
+const MAX_OTP_ATTEMPTS = 5;
+const LOGIN_OTP_TYPE = 'LOGIN_OTP' as OtpCodeType;
 
 @Injectable()
 export class AuthService {
@@ -190,6 +203,245 @@ export class AuthService {
     return { success: true };
   }
 
+  async requestOtp(dto: RequestOtpDto) {
+    const normalizedPhone = this.normalizePhone(dto.phone);
+    const now = new Date();
+    const otpCode = this.generateNumericOtp();
+    const otpCodeHash = await this.passwordService.hashPassword(otpCode);
+
+    await this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.upsert({
+        where: { phone: normalizedPhone },
+        update: {},
+        create: {
+          phone: normalizedPhone,
+          systemRole: SystemRole.USER,
+          isPhoneVerified: false,
+        },
+        select: { id: true, phone: true },
+      });
+
+      // Se invalida cualquier OTP de login previo para reducir ventanas de ataque.
+      await tx.otpCode.updateMany({
+        where: {
+          userId: user.id,
+          type: LOGIN_OTP_TYPE,
+          consumed: false,
+        },
+        data: { consumed: true },
+      });
+
+      await tx.otpCode.create({
+        data: {
+          userId: user.id,
+          type: LOGIN_OTP_TYPE,
+          codeHash: otpCodeHash,
+          expiresAt: new Date(now.getTime() + LOGIN_OTP_TTL_MINUTES * 60 * 1000),
+          attempts: 0,
+          consumed: false,
+        },
+      });
+
+      // Simulación temporal de envío (en producción debe pasar por proveedor WhatsApp/SMS).
+      console.log(`[SIMULACION OTP] Login OTP para ${user.phone}: ${otpCode}`);
+    });
+
+    // Mensaje genérico para evitar enumeración de usuarios.
+    return { message: GENERIC_OTP_REQUEST_MESSAGE };
+  }
+
+  async verifyOtp(dto: VerifyOtpDto) {
+    const normalizedPhone = this.normalizePhone(dto.phone);
+    const user = await this.prisma.user.findUnique({
+      where: { phone: normalizedPhone },
+      select: {
+        id: true,
+        systemRole: true,
+        email: true,
+        passwordHash: true,
+        memberships: {
+          select: { organizationId: true },
+        },
+      },
+    });
+
+    if (!user) {
+      throw new BadRequestException(INVALID_OTP_MESSAGE);
+    }
+
+    const otp = await this.prisma.otpCode.findFirst({
+      where: {
+        userId: user.id,
+        type: LOGIN_OTP_TYPE,
+        consumed: false,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!otp) {
+      throw new BadRequestException(INVALID_OTP_MESSAGE);
+    }
+
+    const otpIsValid = await this.passwordService.comparePassword(
+      dto.otpCode,
+      otp.codeHash,
+    );
+
+    if (!otpIsValid) {
+      const nextAttempts = otp.attempts + 1;
+      await this.prisma.otpCode.update({
+        where: { id: otp.id },
+        data: {
+          attempts: nextAttempts,
+          ...(nextAttempts >= MAX_OTP_ATTEMPTS ? { consumed: true } : {}),
+        },
+      });
+      throw new BadRequestException(INVALID_OTP_MESSAGE);
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.otpCode.update({
+        where: { id: otp.id },
+        data: { consumed: true },
+      });
+
+      await tx.user.update({
+        where: { id: user.id },
+        data: { isPhoneVerified: true },
+      });
+
+      const hasCompletedProfile = Boolean(user.email && user.passwordHash);
+      const hasMembership = user.memberships.length > 0;
+
+      if (!hasCompletedProfile || !hasMembership) {
+        const onboardingToken = await this.tokenService.generateOnboardingToken({
+          sub: user.id,
+          systemRole: user.systemRole,
+        });
+
+        return {
+          requiresRegistrationCompletion: true,
+          onboardingToken,
+        };
+      }
+
+      const preferredOrganizationId =
+        user.memberships.length === 1 ? user.memberships[0].organizationId : undefined;
+      const tokens = await this.issueSessionTokens(tx, {
+        userId: user.id,
+        systemRole: user.systemRole,
+        organizationId: preferredOrganizationId,
+      });
+
+      return {
+        requiresRegistrationCompletion: false,
+        ...tokens,
+      };
+    });
+  }
+
+  async completeRegistration(onboardingToken: string, dto: CompleteRegistrationDto) {
+    const payload = await this.verifyOnboardingPayload(onboardingToken);
+    await this.ensurePasswordStrength(dto.password);
+    await this.ensureEmailAvailableForUser(dto.email, payload.sub);
+
+    return this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.findUnique({
+        where: { id: payload.sub },
+        select: {
+          id: true,
+          phone: true,
+          systemRole: true,
+          memberships: { select: { organizationId: true, role: true } },
+        },
+      });
+
+      if (!user) {
+        throw new NotFoundException('Usuario no encontrado');
+      }
+
+      const passwordHash = await this.passwordService.hashPassword(dto.password);
+
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          email: dto.email.trim().toLowerCase(),
+          passwordHash,
+        },
+      });
+
+      const existingOwnerMembership = user.memberships.find((membership) => membership.role === 'OWNER');
+      let organizationId = existingOwnerMembership?.organizationId;
+
+      if (!organizationId) {
+        const organization = await tx.organization.create({
+          data: {
+            name: dto.organizationName,
+            email: dto.email.trim().toLowerCase(),
+            // En onboarding phone-first reutilizamos el teléfono verificado como base de contacto.
+            phone: user.phone ?? 'PENDING_PHONE',
+          },
+        });
+        organizationId = organization.id;
+
+        await tx.organizationMember.create({
+          data: {
+            organizationId,
+            userId: user.id,
+            role: OrganizationRole.OWNER,
+          },
+        });
+      }
+
+      const tokens = await this.issueSessionTokens(tx, {
+        userId: user.id,
+        systemRole: user.systemRole,
+        organizationId,
+      });
+
+      return {
+        organizationId,
+        ...tokens,
+      };
+    });
+  }
+
+  async selectOrganization(actorId: string | null, dto: SelectOrganizationDto) {
+    if (!actorId) {
+      throw new UnauthorizedException(INVALID_TOKEN_MESSAGE);
+    }
+
+    const membership = await this.prisma.organizationMember.findFirst({
+      where: {
+        userId: actorId,
+        organizationId: dto.organizationId,
+      },
+      select: { id: true },
+    });
+
+    if (!membership) {
+      throw new ForbiddenException(INVALID_ORGANIZATION_MESSAGE);
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: actorId },
+      select: { id: true, systemRole: true },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException(INVALID_TOKEN_MESSAGE);
+    }
+
+    return this.prisma.$transaction(async (tx) =>
+      this.issueSessionTokens(tx, {
+        userId: user.id,
+        systemRole: user.systemRole,
+        organizationId: dto.organizationId,
+      }),
+    );
+  }
+
   async requestPasswordReset(dto: RequestPasswordResetDto) {
     const user = await this.prisma.user.findFirst({
       where: {
@@ -245,9 +497,7 @@ export class AuthService {
   }
 
   async resetPassword(dto: ResetPasswordDto) {
-    if (!this.isPasswordStrong(dto.newPassword)) {
-      throw new BadRequestException(INVALID_OTP_MESSAGE);
-    }
+    await this.ensurePasswordStrength(dto.newPassword);
 
     const user = await this.prisma.user.findFirst({
       where: {
@@ -332,6 +582,18 @@ export class AuthService {
     }
   }
 
+  private async verifyOnboardingPayload(token: string) {
+    try {
+      const payload = await this.tokenService.verifyOnboardingToken(token);
+      if (payload.tokenType !== 'onboarding') {
+        throw new UnauthorizedException(INVALID_TOKEN_MESSAGE);
+      }
+      return payload;
+    } catch {
+      throw new UnauthorizedException(INVALID_TOKEN_MESSAGE);
+    }
+  }
+
   private isAccountLocked(lockUntil: Date | null): boolean {
     return Boolean(lockUntil && lockUntil > new Date());
   }
@@ -362,6 +624,70 @@ export class AuthService {
 
   private isPasswordStrong(password: string): boolean {
     return /^(?=.*[A-Za-z])(?=.*\d).{8,}$/.test(password);
+  }
+
+  private async ensurePasswordStrength(password: string): Promise<void> {
+    if (!this.isPasswordStrong(password)) {
+      throw new BadRequestException(
+        'La contraseña debe tener mínimo 8 caracteres, una letra y un número.',
+      );
+    }
+  }
+
+  private async ensureEmailAvailableForUser(
+    email: string,
+    userId: string,
+  ): Promise<void> {
+    const normalizedEmail = email.trim().toLowerCase();
+    const existing = await this.prisma.user.findFirst({
+      where: {
+        email: { equals: normalizedEmail, mode: 'insensitive' },
+        NOT: { id: userId },
+      },
+      select: { id: true },
+    });
+
+    if (existing) {
+      throw new BadRequestException(INVALID_REGISTRATION_MESSAGE);
+    }
+  }
+
+  private normalizePhone(phone: string): string {
+    return phone.trim();
+  }
+
+  private async issueSessionTokens(
+    tx: Prisma.TransactionClient,
+    input: {
+      userId: string;
+      systemRole: SystemRole;
+      organizationId?: string;
+    },
+  ) {
+    const refreshJti = randomUUID();
+    const accessToken = await this.tokenService.generateAccessToken({
+      sub: input.userId,
+      systemRole: input.systemRole,
+      ...(input.organizationId ? { organizationId: input.organizationId } : {}),
+    });
+    const refreshToken = await this.tokenService.generateRefreshToken({
+      sub: input.userId,
+      systemRole: input.systemRole,
+      jti: refreshJti,
+      ...(input.organizationId ? { organizationId: input.organizationId } : {}),
+    });
+    const refreshTokenHash = await this.tokenService.hashToken(refreshToken);
+
+    await tx.refreshToken.create({
+      data: {
+        id: refreshJti,
+        userId: input.userId,
+        tokenHash: refreshTokenHash,
+        expiresAt: this.tokenService.getRefreshTokenExpiryDate(),
+      },
+    });
+
+    return { accessToken, refreshToken };
   }
 
   private async revokeAllUserRefreshTokens(

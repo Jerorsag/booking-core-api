@@ -52,6 +52,27 @@ export class TokenService {
     });
   }
 
+  async generateOnboardingToken(
+    payload: Omit<JwtPayload, 'tokenType'>,
+  ): Promise<string> {
+    return this.jwtService.signAsync(
+      {
+        ...payload,
+        tokenType: 'onboarding',
+      },
+      {
+        secret: this.getOnboardingSecret(),
+        expiresIn: this.getOnboardingExpiresIn(),
+      },
+    );
+  }
+
+  async verifyOnboardingToken(token: string): Promise<JwtPayload> {
+    return this.jwtService.verifyAsync<JwtPayload>(token, {
+      secret: this.getOnboardingSecret(),
+    });
+  }
+
   async hashToken(token: string): Promise<string> {
     return bcrypt.hash(token, this.tokenSaltRounds);
   }
@@ -79,6 +100,13 @@ export class TokenService {
     );
   }
 
+  private getOnboardingSecret(): string {
+    return (
+      this.configService.get<string>('JWT_ONBOARDING_SECRET') ??
+      'dev_onboarding_secret_change_me'
+    );
+  }
+
   private getAccessExpiresIn(): StringValue {
     return (this.configService.get<string>('JWT_ACCESS_EXPIRES_IN') ??
       '15m') as StringValue;
@@ -87,5 +115,10 @@ export class TokenService {
   private getRefreshExpiresIn(): StringValue {
     return (this.configService.get<string>('JWT_REFRESH_EXPIRES_IN') ??
       '7d') as StringValue;
+  }
+
+  private getOnboardingExpiresIn(): StringValue {
+    return (this.configService.get<string>('JWT_ONBOARDING_EXPIRES_IN') ??
+      '15m') as StringValue;
   }
 }

@@ -3,5 +3,5 @@ export interface JwtPayload {
   systemRole: string;
   organizationId?: string;
   jti?: string;
-  tokenType: 'access' | 'refresh';
+  tokenType: 'access' | 'refresh' | 'onboarding';
 }

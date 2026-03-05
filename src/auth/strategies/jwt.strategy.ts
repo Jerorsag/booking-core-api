@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ConfigService } from '@nestjs/config';
 import { ExtractJwt, Strategy } from 'passport-jwt';
@@ -18,6 +18,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   async validate(payload: JwtPayload) {
+    // Esta estrategia protege rutas autenticadas estándar, por eso exige token de acceso.
+    if (payload.tokenType !== 'access') {
+      throw new UnauthorizedException('Token JWT inválido o expirado.');
+    }
+
     // Este objeto se adjunta a req.user automáticamente por Passport.
     return {
       sub: payload.sub,

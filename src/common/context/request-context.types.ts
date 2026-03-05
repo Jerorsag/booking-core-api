@@ -7,7 +7,7 @@ export interface RequestUser {
   userId?: string;
   organizationId?: string;
   jti?: string;
-  tokenType?: 'access' | 'refresh';
+  tokenType?: 'access' | 'refresh' | 'onboarding';
   role?: string;
   systemRole?: string;
   roles?: string[];
