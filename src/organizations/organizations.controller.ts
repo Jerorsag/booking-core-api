@@ -15,6 +15,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { Scope } from '../common/context/scope.enum';
 import type { RequestWithContext } from '../common/context/request-context.types';
 import { RequestScope } from '../common/decorators/request-scope.decorator';
+import { CreateInvitationDto } from './dto/create-invitation.dto';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { ListOrganizationsDto } from './dto/list-organizations.dto';
@@ -85,6 +86,21 @@ export class OrganizationsController {
   ) {
     const actorId = req.user?.sub ?? req.user?.id ?? req.context?.actorId ?? null;
     return this.organizationsService.createStaff(organizationId, dto, actorId);
+  }
+
+  @Post(':organizationId/invitations')
+  @UseGuards(JwtAuthGuard)
+  @RequestScope(Scope.SYSTEM)
+  @ApiOperation({
+    summary: 'Invita staff por token de activación (solo OWNER)',
+  })
+  createInvitation(
+    @Param('organizationId', ParseUUIDPipe) organizationId: string,
+    @Body() dto: CreateInvitationDto,
+    @Req() req: RequestWithContext,
+  ) {
+    const actorId = req.user?.sub ?? req.user?.id ?? req.context?.actorId ?? null;
+    return this.organizationsService.createInvitation(organizationId, dto, actorId);
   }
 
   private assertSuperAdmin(req: RequestWithContext): void {

@@ -52,6 +52,7 @@ enum ScheduleExceptionType {
 
 enum OtpCodeType {
   PASSWORD_RESET
+  LOGIN_OTP
 }
 
 //////////////////////////////
@@ -102,6 +103,7 @@ model Organization {
   subscription     Subscription?
   branches         Branch[]
   members          OrganizationMember[]
+  invitations      Invitation[]
   services         Service[]
   staffProfiles    StaffProfile[]
   appointments     Appointment[]
@@ -175,6 +177,24 @@ model OrganizationMember {
   createdAt DateTime @default(now())
 
   @@unique([organizationId, userId])
+}
+
+model Invitation {
+  id             String           @id @default(uuid())
+  email          String
+  organizationId String
+  role           OrganizationRole
+  tokenHash      String
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdBy      String
+  createdAt      DateTime         @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, email])
+  @@index([expiresAt])
+  @@index([createdBy])
 }
 
 model RefreshToken {
