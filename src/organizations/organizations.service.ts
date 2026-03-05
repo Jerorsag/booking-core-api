@@ -6,7 +6,7 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import {
   OrganizationRole,
   Prisma,
@@ -15,6 +15,7 @@ import {
 import { PasswordService } from '../auth/services/password.service';
 import { TokenService } from '../auth/services/token.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { CreateInvitationDto } from './dto/create-invitation.dto';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { ListOrganizationsDto } from './dto/list-organizations.dto';
@@ -22,6 +23,8 @@ import { RegisterOrganizationDto } from './dto/register-organization.dto';
 
 @Injectable()
 export class OrganizationsService {
+  private readonly invitationExpiryHours = 48;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly passwordService: PasswordService,
@@ -206,6 +209,118 @@ export class OrganizationsService {
         organizationId,
         membershipId: membership.id,
         role: membership.role,
+      };
+    });
+  }
+
+  async createInvitation(
+    organizationId: string,
+    dto: CreateInvitationDto,
+    actorId: string | null,
+  ) {
+    if (!actorId) {
+      throw new UnauthorizedException('No se pudo identificar el usuario actor.');
+    }
+
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const [organization, ownerMembership] = await Promise.all([
+      this.prisma.organization.findFirst({
+        where: { id: organizationId, deletedAt: null },
+        select: { id: true },
+      }),
+      this.prisma.organizationMember.findFirst({
+        where: {
+          organizationId,
+          userId: actorId,
+          role: OrganizationRole.OWNER,
+        },
+        select: { id: true },
+      }),
+    ]);
+
+    if (!organization) {
+      throw new NotFoundException('La organización solicitada no existe.');
+    }
+
+    if (!ownerMembership) {
+      throw new ForbiddenException(
+        'Acceso denegado: solo un OWNER puede invitar usuarios.',
+      );
+    }
+
+    if (dto.role !== OrganizationRole.STAFF) {
+      throw new BadRequestException('Solo se permiten invitaciones de tipo STAFF.');
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const existingUser = await tx.user.findFirst({
+        where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
+        select: { id: true },
+      });
+
+      if (existingUser) {
+        const existingMembership = await tx.organizationMember.findFirst({
+          where: {
+            organizationId,
+            userId: existingUser.id,
+          },
+          select: { id: true },
+        });
+
+        if (existingMembership) {
+          throw new ConflictException(
+            'El usuario ya está vinculado a esta organización.',
+          );
+        }
+      }
+
+      const pendingInvitation = await tx.invitation.findFirst({
+        where: {
+          organizationId,
+          email: { equals: normalizedEmail, mode: 'insensitive' },
+          acceptedAt: null,
+          expiresAt: { gt: new Date() },
+        },
+        select: { id: true },
+      });
+
+      if (pendingInvitation) {
+        throw new ConflictException(
+          'Ya existe una invitación activa para este correo en la organización.',
+        );
+      }
+
+      const invitationId = randomUUID();
+      const invitationToken = `${invitationId}.${randomBytes(24).toString('hex')}`;
+      const tokenHash = await this.tokenService.hashToken(invitationToken);
+      const expiresAt = new Date(
+        Date.now() + this.invitationExpiryHours * 60 * 60 * 1000,
+      );
+
+      await tx.invitation.create({
+        data: {
+          id: invitationId,
+          email: normalizedEmail,
+          organizationId,
+          role: dto.role,
+          tokenHash,
+          expiresAt,
+          acceptedAt: null,
+          createdBy: actorId,
+        },
+      });
+
+      // Simulación temporal de envío. El token plano no se persiste para reducir riesgo.
+      console.log(
+        `[SIMULACION INVITACION] /accept-invitation?token=${invitationToken}`,
+      );
+
+      return {
+        message: 'Invitación enviada correctamente.',
+        organizationId,
+        email: normalizedEmail,
+        role: dto.role,
+        expiresAt,
       };
     });
   }

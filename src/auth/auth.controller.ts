@@ -17,6 +17,7 @@ import {
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
+import { AcceptInvitationDto } from './dto/accept-invitation.dto';
 import { AuthTokensDto } from './dto/auth-tokens.dto';
 import { CompleteRegistrationDto } from './dto/complete-registration.dto';
 import { LoginDto } from './dto/login.dto';
@@ -142,6 +143,17 @@ export class AuthController {
   ) {
     const actorId = req.user?.sub ?? req.user?.id ?? req.context?.actorId ?? null;
     return this.authService.selectOrganization(actorId, dto);
+  }
+
+  @Post('accept-invitation')
+  @ApiOperation({
+    summary: 'Acepta invitación de organización y crea membership',
+  })
+  @ApiBody({ type: AcceptInvitationDto })
+  @ApiOkResponse({ type: AuthTokensDto })
+  @ApiBadRequestResponse({ description: 'Invitación inválida' })
+  acceptInvitation(@Body() dto: AcceptInvitationDto) {
+    return this.authService.acceptInvitation(dto);
   }
 
   private extractBearerToken(authorization?: string): string {

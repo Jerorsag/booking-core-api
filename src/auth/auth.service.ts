@@ -3,11 +3,13 @@ import {
   Injectable,
   UnauthorizedException,
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
 import { OrganizationRole, OtpCodeType, Prisma, SystemRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { AcceptInvitationDto } from './dto/accept-invitation.dto';
 import { CompleteRegistrationDto } from './dto/complete-registration.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
@@ -26,6 +28,7 @@ const GENERIC_OTP_REQUEST_MESSAGE =
 const GENERIC_RESET_REQUEST_MESSAGE =
   'Si el usuario existe, se ha enviado un código de recuperación.';
 const INVALID_OTP_MESSAGE = 'Código inválido';
+const INVALID_INVITATION_MESSAGE = 'Invitación inválida';
 const INVALID_ORGANIZATION_MESSAGE = 'Organización inválida';
 const INVALID_REGISTRATION_MESSAGE = 'Datos de registro inválidos';
 const RESET_PASSWORD_SUCCESS_MESSAGE = 'Contraseña actualizada correctamente';
@@ -442,6 +445,130 @@ export class AuthService {
     );
   }
 
+  async acceptInvitation(dto: AcceptInvitationDto) {
+    const invitationId = this.extractInvitationId(dto.token);
+
+    const invitation = await this.prisma.invitation.findFirst({
+      where: {
+        id: invitationId,
+        acceptedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      select: {
+        id: true,
+        email: true,
+        organizationId: true,
+        role: true,
+        tokenHash: true,
+      },
+    });
+
+    if (!invitation) {
+      throw new BadRequestException(INVALID_INVITATION_MESSAGE);
+    }
+
+    const tokenMatches = await this.tokenService.compareTokenHash(
+      dto.token,
+      invitation.tokenHash,
+    );
+
+    if (!tokenMatches) {
+      throw new BadRequestException(INVALID_INVITATION_MESSAGE);
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const freshInvitation = await tx.invitation.findFirst({
+        where: {
+          id: invitation.id,
+          acceptedAt: null,
+          expiresAt: { gt: new Date() },
+        },
+        select: {
+          id: true,
+          email: true,
+          organizationId: true,
+          role: true,
+        },
+      });
+
+      if (!freshInvitation) {
+        throw new BadRequestException(INVALID_INVITATION_MESSAGE);
+      }
+
+      const normalizedEmail = freshInvitation.email.trim().toLowerCase();
+      const existingUser = await tx.user.findFirst({
+        where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
+        select: { id: true, systemRole: true },
+      });
+
+      let userId = existingUser?.id;
+      let userSystemRole = existingUser?.systemRole ?? SystemRole.USER;
+
+      if (!existingUser) {
+        if (!dto.password) {
+          throw new BadRequestException(
+            'La contraseña es obligatoria para aceptar esta invitación.',
+          );
+        }
+
+        await this.ensurePasswordStrength(dto.password);
+        const passwordHash = await this.passwordService.hashPassword(dto.password);
+
+        const createdUser = await tx.user.create({
+          data: {
+            email: normalizedEmail,
+            passwordHash,
+            systemRole: SystemRole.USER,
+            isEmailVerified: false,
+            isPhoneVerified: false,
+          },
+          select: { id: true, systemRole: true },
+        });
+
+        userId = createdUser.id;
+        userSystemRole = createdUser.systemRole;
+      }
+
+      if (!userId) {
+        throw new BadRequestException(INVALID_INVITATION_MESSAGE);
+      }
+
+      const existingMembership = await tx.organizationMember.findFirst({
+        where: {
+          organizationId: freshInvitation.organizationId,
+          userId,
+        },
+        select: { id: true },
+      });
+
+      if (existingMembership) {
+        throw new ConflictException(
+          'El usuario ya está vinculado a esta organización.',
+        );
+      }
+
+      await tx.organizationMember.create({
+        data: {
+          organizationId: freshInvitation.organizationId,
+          userId,
+          role: freshInvitation.role,
+        },
+      });
+
+      await tx.invitation.update({
+        where: { id: freshInvitation.id },
+        data: { acceptedAt: new Date() },
+      });
+
+      // Se emiten tokens con organizationId activa para mantener contexto tenant inmediato.
+      return this.issueSessionTokens(tx, {
+        userId,
+        systemRole: userSystemRole,
+        organizationId: freshInvitation.organizationId,
+      });
+    });
+  }
+
   async requestPasswordReset(dto: RequestPasswordResetDto) {
     const user = await this.prisma.user.findFirst({
       where: {
@@ -654,6 +781,21 @@ export class AuthService {
 
   private normalizePhone(phone: string): string {
     return phone.trim();
+  }
+
+  private extractInvitationId(token: string): string {
+    const [invitationId] = token.split('.');
+    if (!invitationId) {
+      throw new BadRequestException(INVALID_INVITATION_MESSAGE);
+    }
+
+    const uuidV4Regex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuidV4Regex.test(invitationId)) {
+      throw new BadRequestException(INVALID_INVITATION_MESSAGE);
+    }
+
+    return invitationId;
   }
 
   private async issueSessionTokens(
