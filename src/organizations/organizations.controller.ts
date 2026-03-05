@@ -8,19 +8,32 @@ import {
   Post,
   Query,
   Req,
+  UseGuards,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { Scope } from '../common/context/scope.enum';
 import type { RequestWithContext } from '../common/context/request-context.types';
 import { RequestScope } from '../common/decorators/request-scope.decorator';
+import { CreateStaffDto } from './dto/create-staff.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { ListOrganizationsDto } from './dto/list-organizations.dto';
+import { RegisterOrganizationDto } from './dto/register-organization.dto';
 import { OrganizationsService } from './organizations.service';
 
 @ApiTags('Organizations')
 @Controller('organizations')
 export class OrganizationsController {
   constructor(private readonly organizationsService: OrganizationsService) {}
+
+  @Post('register')
+  @RequestScope(Scope.SYSTEM)
+  @ApiOperation({
+    summary: 'Registro de Organization + OWNER con emisión de tokens',
+  })
+  registerOrganization(@Body() dto: RegisterOrganizationDto) {
+    return this.organizationsService.registerOrganization(dto);
+  }
 
   @Post()
   @RequestScope(Scope.SYSTEM)
@@ -57,6 +70,21 @@ export class OrganizationsController {
   })
   getOrganizationById(@Param('id', ParseUUIDPipe) id: string) {
     return this.organizationsService.getOrganizationById(id);
+  }
+
+  @Post(':organizationId/staff')
+  @UseGuards(JwtAuthGuard)
+  @RequestScope(Scope.SYSTEM)
+  @ApiOperation({
+    summary: 'Crea usuario STAFF en una organización (solo OWNER)',
+  })
+  createStaff(
+    @Param('organizationId', ParseUUIDPipe) organizationId: string,
+    @Body() dto: CreateStaffDto,
+    @Req() req: RequestWithContext,
+  ) {
+    const actorId = req.user?.sub ?? req.user?.id ?? req.context?.actorId ?? null;
+    return this.organizationsService.createStaff(organizationId, dto, actorId);
   }
 
   private assertSuperAdmin(req: RequestWithContext): void {

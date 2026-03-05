@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { AuthModule } from './auth/auth.module';
 import { StructuredLoggerService } from './common/logging/structured-logger.service';
 import { HealthController } from './health.controller';
 import { OrganizationsModule } from './organizations/organizations.module';
@@ -12,6 +13,7 @@ import { PrismaModule } from './prisma/prisma.module';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    AuthModule,
     PrismaModule,
     OrganizationsModule,
   ],

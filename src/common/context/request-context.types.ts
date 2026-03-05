@@ -6,6 +6,8 @@ export interface RequestUser {
   id?: string;
   userId?: string;
   organizationId?: string;
+  jti?: string;
+  tokenType?: 'access' | 'refresh';
   role?: string;
   systemRole?: string;
   roles?: string[];
